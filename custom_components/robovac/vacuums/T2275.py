@@ -1,8 +1,13 @@
+"""eufy Clean L50 (T2275)
+
+Protocol 3.4 device. DPS codes confirmed via live device capture.
+"""
 from homeassistant.components.vacuum import VacuumEntityFeature
 from .base import RoboVacEntityFeature, RobovacCommand, RobovacModelDetails
 
 
 class T2275(RobovacModelDetails):
+    protocol_version = 3.4
     homeassistant_features = (
         VacuumEntityFeature.FAN_SPEED
         | VacuumEntityFeature.LOCATE
@@ -21,38 +26,75 @@ class T2275(RobovacModelDetails):
         RobovacCommand.MODE: {
             "code": 152,
             "values": {
-                "small_room": "AA==",
-                "pause": "AggN",
-                "edge": "AggG",
                 "auto": "BBoCCAE=",
-                "nosweep": "AggO",
+                "pause": "AggN",
+                "Spot": "AA==",
+                "return": "AggG",
+                "Nosweep": "AggO",
             },
         },
         RobovacCommand.STATUS: {
-            "code": 173,
-        },
-        RobovacCommand.RETURN_HOME: {
             "code": 153,
+            "values": [
+                "BgoAEAUyAA===",
+                "BgoAEAVSAA===",
+                "CAoAEAUyAggB",
+                "CAoCCAEQBTIA",
+                "CAoCCAEQBVIA",
+                "CgoCCAEQBTICCAE=",
+                "CAoCCAIQBTIA",
+                "CAoCCAIQBVIA",
+                "CgoCCAIQBTICCAE=",
+                "BAoAEAY=",
+                "BBAHQgA=",
+                "BBADGgA=",
+                "BhADGgIIAQ==",
+                "AA==",
+                "AhAB",
+            ],
+        },
+        RobovacCommand.DIRECTION: {
+            "code": 155,
             "values": {
-                "return_home": "AggB",
+                "brake": "brake",
+                "forward": "forward",
+                "back": "back",
+                "left": "left",
+                "right": "right",
             },
+        },
+        RobovacCommand.START_PAUSE: {
+            "code": 156,
+        },
+        RobovacCommand.DO_NOT_DISTURB: {
+            "code": 157,
         },
         RobovacCommand.FAN_SPEED: {
-            "code": 154,
+            "code": 158,
             "values": {
-                "fan_speed": "AgkBCgIKAQoDCgEKBAoB",
+                "quiet": "Quiet",
+                "standard": "Standard",
+                "turbo": "Turbo",
+                "max": "Max",
+                "boost_iq": "Boost_IQ",
             },
+        },
+        RobovacCommand.BOOST_IQ: {
+            "code": 159,
         },
         RobovacCommand.LOCATE: {
-            "code": 153,
-            "values": {
-                "locate": "AggC",
-            },
+            "code": 160,
         },
         RobovacCommand.BATTERY: {
-            "code": 172,
+            "code": 163,
+        },
+        RobovacCommand.CONSUMABLES: {
+            "code": 168,
+        },
+        RobovacCommand.RETURN_HOME: {
+            "code": 173,
         },
         RobovacCommand.ERROR: {
-            "code": 169,
+            "code": 177,
         },
     }
