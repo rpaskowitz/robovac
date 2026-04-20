@@ -1170,15 +1170,27 @@ class TuyaDevice:
             self.writer.write(header + encrypted_nonce + footer)
             await self.writer.drain()
 
-            # Step 2: Receive SESS_KEY_NEG_RESP (0x04)
-            try:
-                raw = await asyncio.wait_for(
-                    self.reader.readuntil(MAGIC_SUFFIX_BYTES), timeout=self.timeout
-                )
-            except asyncio.TimeoutError:
-                raise
-            except asyncio.IncompleteReadError:
-                raise
+            # Step 2: Receive SESS_KEY_NEG_RESP (0x04).
+            # The device may also send its own SESS_KEY_NEG_START (0x03) when
+            # we first connect — skip those and keep reading until we get 0x04.
+            while True:
+                try:
+                    raw = await asyncio.wait_for(
+                        self.reader.readuntil(MAGIC_SUFFIX_BYTES), timeout=self.timeout
+                    )
+                except asyncio.TimeoutError:
+                    raise
+                except asyncio.IncompleteReadError:
+                    raise
+                # Peek at the command byte before doing full parsing.
+                if len(raw) >= header_size:
+                    _, _, peek_cmd, _ = struct.unpack_from(MESSAGE_PREFIX_FORMAT, raw)
+                    if peek_cmd == Message.SESS_KEY_NEG_START:
+                        self._LOGGER.debug(
+                            "Received device-initiated SESS_KEY_NEG_START (0x03), skipping"
+                        )
+                        continue
+                break
 
             # Parse v3.4 response manually — payload is binary (not JSON).
             try:
@@ -1246,13 +1258,14 @@ class TuyaDevice:
             await self.writer.drain()
 
             # Step 4: Derive session key.
-            # XOR the two nonces, AES-ECB encrypt the result, take bytes [12:28].
+            # XOR the two nonces, AES-ECB encrypt the result.
+            # For v3.4 the full 16-byte encrypted result is the session key
+            # (unlike v3.5 which takes bytes [12:28] of a GCM result).
             xored = bytes(a ^ b for a, b in zip(local_nonce, remote_nonce))
             ecb_enc3 = Cipher(
                 algorithms.AES(real_key), modes.ECB(), backend=openssl_backend
             ).encryptor()
-            encrypted = ecb_enc3.update(xored) + ecb_enc3.finalize()
-            session_key = encrypted[12:28]
+            session_key = ecb_enc3.update(xored) + ecb_enc3.finalize()
 
             if session_key[0] == 0x00:
                 self._LOGGER.debug(
