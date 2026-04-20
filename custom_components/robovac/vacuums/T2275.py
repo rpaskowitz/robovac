@@ -1,4 +1,4 @@
-"""eufy Clean L50 (T2275)
+"""eufy Clean L50 SES (T2275)
 
 Protocol 3.4 device. DPS codes confirmed via live device capture.
 """
