@@ -1128,15 +1128,17 @@ class TuyaDevice:
     async def _negotiate_session_key_v34(self) -> None:
         """Negotiate a session key with a Protocol 3.4 device.
 
-        Protocol 3.4 uses AES-ECB encryption and HMAC-SHA256 message framing
-        (unlike 3.5 which uses AES-GCM).  The 3-step handshake:
-        1. Send SESS_KEY_NEG_START with ECB-encrypted 16-byte client nonce
-        2. Receive SESS_KEY_NEG_RESP with ECB-encrypted (remote_nonce + HMAC)
-        3. Send SESS_KEY_NEG_FINISH with ECB-encrypted HMAC of remote nonce
-        4. Derive session key: XOR nonces → AES-ECB encrypt → bytes [12:28]
+        Protocol 3.4 uses device-initiated negotiation with AES-ECB encryption
+        and HMAC-SHA256 message framing.  The device sends the first message
+        when the client connects:
+
+        1. Device sends SESS_KEY_NEG_START (0x03): ECB(device_nonce)
+        2. Client sends SESS_KEY_NEG_RESP  (0x04): ECB(client_nonce + HMAC(key, device_nonce))
+        3. Device sends SESS_KEY_NEG_FINISH(0x05): ECB(HMAC(key, client_nonce))
+        4. Derive session key: AES-ECB(XOR(client_nonce, device_nonce))
 
         If the first byte of the derived session key is 0x00 the device will
-        reject it; the negotiation is retried up to 3 times.
+        reject it.  A reconnect will trigger a fresh negotiation with new nonces.
         """
         if self.writer is None:
             raise ConnectionFailedException("Writer not initialized")
@@ -1151,137 +1153,114 @@ class TuyaDevice:
         header_size = struct.calcsize(MESSAGE_PREFIX_FORMAT)
         suffix_size = struct.calcsize(MESSAGE_SUFFIX_FORMAT_34)
 
-        for attempt in range(3):
-            local_nonce = os.urandom(16)
-
-            # Step 1: Send SESS_KEY_NEG_START (0x03)
-            # Nonce is exactly one AES block — encrypt without padding.
-            ecb_enc = Cipher(
+        def _ecb_encrypt(data: bytes) -> bytes:
+            enc = Cipher(
                 algorithms.AES(real_key), modes.ECB(), backend=openssl_backend
             ).encryptor()
-            encrypted_nonce = ecb_enc.update(local_nonce) + ecb_enc.finalize()
+            return enc.update(data) + enc.finalize()
 
-            payload_size = len(encrypted_nonce) + suffix_size
-            header = struct.pack(
-                MESSAGE_PREFIX_FORMAT, MAGIC_PREFIX, 1, Message.SESS_KEY_NEG_START, payload_size
-            )
-            hmac_val = self.cipher.hmac_sha256(header + encrypted_nonce)
-            footer = struct.pack(MESSAGE_SUFFIX_FORMAT_34, hmac_val, MAGIC_SUFFIX)
-            self.writer.write(header + encrypted_nonce + footer)
-            await self.writer.drain()
+        def _ecb_decrypt(data: bytes) -> bytes:
+            dec = Cipher(
+                algorithms.AES(real_key), modes.ECB(), backend=openssl_backend
+            ).decryptor()
+            return dec.update(data) + dec.finalize()
 
-            # Step 2: Receive SESS_KEY_NEG_RESP (0x04).
-            # The device may also send its own SESS_KEY_NEG_START (0x03) when
-            # we first connect — skip those and keep reading until we get 0x04.
-            while True:
-                try:
-                    raw = await asyncio.wait_for(
-                        self.reader.readuntil(MAGIC_SUFFIX_BYTES), timeout=self.timeout
-                    )
-                except asyncio.TimeoutError:
-                    raise
-                except asyncio.IncompleteReadError:
-                    raise
-                # Peek at the command byte before doing full parsing.
-                if len(raw) >= header_size:
-                    _, _, peek_cmd, _ = struct.unpack_from(MESSAGE_PREFIX_FORMAT, raw)
-                    if peek_cmd == Message.SESS_KEY_NEG_START:
-                        self._LOGGER.debug(
-                            "Received device-initiated SESS_KEY_NEG_START (0x03), skipping"
-                        )
-                        continue
-                break
-
-            # Parse v3.4 response manually — payload is binary (not JSON).
+        def _read_v34_payload(raw: bytes) -> tuple[int, bytes]:
+            """Parse a raw v3.4 message, verify HMAC, and return (cmd, ecb_payload)."""
             try:
                 r_prefix, _, r_cmd, r_payload_size = struct.unpack_from(
                     MESSAGE_PREFIX_FORMAT, raw
                 )
             except struct.error as e:
-                raise InvalidMessage("Invalid SESS_KEY_NEG_RESP header") from e
+                raise InvalidMessage("Invalid v3.4 negotiate header") from e
             if r_prefix != MAGIC_PREFIX:
-                raise InvalidMessage("Bad magic prefix in SESS_KEY_NEG_RESP")
-            if r_cmd != Message.SESS_KEY_NEG_RESP:
-                raise InvalidMessage(
-                    "Expected SESS_KEY_NEG_RESP (0x04), got 0x{:02x}".format(r_cmd)
-                )
+                raise InvalidMessage("Bad magic prefix in v3.4 negotiate message")
 
-            resp_payload = raw[header_size : header_size + r_payload_size - suffix_size]
+            payload_bytes = raw[header_size : header_size + r_payload_size - suffix_size]
             try:
-                resp_hmac, r_suffix = struct.unpack_from(
-                    MESSAGE_SUFFIX_FORMAT_34, raw, header_size + r_payload_size - suffix_size
+                msg_hmac, r_suffix = struct.unpack_from(
+                    MESSAGE_SUFFIX_FORMAT_34, raw,
+                    header_size + r_payload_size - suffix_size,
                 )
             except struct.error as e:
-                raise InvalidMessage("Invalid SESS_KEY_NEG_RESP suffix") from e
+                raise InvalidMessage("Invalid v3.4 negotiate suffix") from e
             if r_suffix != MAGIC_SUFFIX:
-                raise InvalidMessage("Bad magic suffix in SESS_KEY_NEG_RESP")
-
-            # Verify the device's HMAC over the entire message up to (not
-            # including) the suffix.
+                raise InvalidMessage("Bad magic suffix in v3.4 negotiate message")
             if not self.cipher.verify_hmac(
-                raw[: header_size + r_payload_size - suffix_size], resp_hmac
+                raw[: header_size + r_payload_size - suffix_size], msg_hmac
             ):
-                raise InvalidMessage("HMAC verification failed on SESS_KEY_NEG_RESP")
+                raise InvalidMessage("HMAC verification failed on v3.4 negotiate message")
 
-            # Decrypt the ECB-encrypted payload.
-            ecb_dec = Cipher(
-                algorithms.AES(real_key), modes.ECB(), backend=openssl_backend
-            ).decryptor()
-            raw_payload = ecb_dec.update(resp_payload) + ecb_dec.finalize()
+            return r_cmd, payload_bytes
 
-            remote_nonce = raw_payload[:16]
-            device_hmac = raw_payload[16:48]
+        def _build_v34_msg(seq: int, cmd: int, ecb_payload: bytes) -> bytes:
+            """Build a v3.4 message with HMAC-SHA256 footer."""
+            payload_size = len(ecb_payload) + suffix_size
+            header = struct.pack(MESSAGE_PREFIX_FORMAT, MAGIC_PREFIX, seq, cmd, payload_size)
+            hmac_val = self.cipher.hmac_sha256(header + ecb_payload)
+            footer = struct.pack(MESSAGE_SUFFIX_FORMAT_34, hmac_val, MAGIC_SUFFIX)
+            return header + ecb_payload + footer
 
-            # Verify device HMAC: HMAC-SHA256(real_key, local_nonce).
-            h = crypto_hmac.HMAC(real_key, SHA256(), backend=openssl_backend)
-            h.update(local_nonce)
-            if h.finalize() != device_hmac:
-                raise InvalidMessage("Device HMAC verification failed in SESS_KEY_NEG_RESP")
-
-            # Step 3: Send SESS_KEY_NEG_FINISH (0x05)
-            h2 = crypto_hmac.HMAC(real_key, SHA256(), backend=openssl_backend)
-            h2.update(remote_nonce)
-            client_hmac = h2.finalize()  # 32 bytes = 2 AES blocks
-
-            ecb_enc2 = Cipher(
-                algorithms.AES(real_key), modes.ECB(), backend=openssl_backend
-            ).encryptor()
-            encrypted_hmac = ecb_enc2.update(client_hmac) + ecb_enc2.finalize()
-
-            payload_size3 = len(encrypted_hmac) + suffix_size
-            header3 = struct.pack(
-                MESSAGE_PREFIX_FORMAT, MAGIC_PREFIX, 2, Message.SESS_KEY_NEG_FINISH, payload_size3
+        # Step 1: Wait for device's SESS_KEY_NEG_START (0x03).
+        try:
+            raw = await asyncio.wait_for(
+                self.reader.readuntil(MAGIC_SUFFIX_BYTES), timeout=self.timeout
             )
-            hmac3 = self.cipher.hmac_sha256(header3 + encrypted_hmac)
-            footer3 = struct.pack(MESSAGE_SUFFIX_FORMAT_34, hmac3, MAGIC_SUFFIX)
-            self.writer.write(header3 + encrypted_hmac + footer3)
-            await self.writer.drain()
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+            raise
 
-            # Step 4: Derive session key.
-            # XOR the two nonces, AES-ECB encrypt the result.
-            # For v3.4 the full 16-byte encrypted result is the session key
-            # (unlike v3.5 which takes bytes [12:28] of a GCM result).
-            xored = bytes(a ^ b for a, b in zip(local_nonce, remote_nonce))
-            ecb_enc3 = Cipher(
-                algorithms.AES(real_key), modes.ECB(), backend=openssl_backend
-            ).encryptor()
-            session_key = ecb_enc3.update(xored) + ecb_enc3.finalize()
+        r_cmd, enc_device_nonce = _read_v34_payload(raw)
+        if r_cmd != Message.SESS_KEY_NEG_START:
+            raise InvalidMessage(
+                "Expected device SESS_KEY_NEG_START (0x03), got 0x{:02x}".format(r_cmd)
+            )
 
-            if session_key[0] == 0x00:
-                self._LOGGER.debug(
-                    "Session key starts with 0x00, retrying negotiation (attempt %d/3)",
-                    attempt + 1,
-                )
-                continue
+        # Device nonce is ECB-encrypted (exactly one AES block = 16 bytes).
+        device_nonce = _ecb_decrypt(enc_device_nonce)[:16]
 
-            self.cipher.set_session_key(session_key)
-            self._LOGGER.debug("v3.4 session key negotiated successfully for %s", self)
-            await asyncio.sleep(0.1)
-            return
+        # Step 2: Send SESS_KEY_NEG_RESP (0x04).
+        # Payload = client_nonce (16 bytes) + HMAC(key, device_nonce) (32 bytes).
+        local_nonce = os.urandom(16)
+        h = crypto_hmac.HMAC(real_key, SHA256(), backend=openssl_backend)
+        h.update(device_nonce)
+        payload_04 = local_nonce + h.finalize()  # 48 bytes = 3 AES blocks
+        self.writer.write(_build_v34_msg(2, Message.SESS_KEY_NEG_RESP, _ecb_encrypt(payload_04)))
+        await self.writer.drain()
 
-        raise ConnectionFailedException(
-            "v3.4 session key negotiation failed: derived key starts with 0x00 after 3 attempts"
-        )
+        # Step 3: Receive device's SESS_KEY_NEG_FINISH (0x05).
+        try:
+            raw3 = await asyncio.wait_for(
+                self.reader.readuntil(MAGIC_SUFFIX_BYTES), timeout=self.timeout
+            )
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+            raise
+
+        r3_cmd, enc_finish = _read_v34_payload(raw3)
+        if r3_cmd != Message.SESS_KEY_NEG_FINISH:
+            raise InvalidMessage(
+                "Expected SESS_KEY_NEG_FINISH (0x05), got 0x{:02x}".format(r3_cmd)
+            )
+
+        # Verify device HMAC: HMAC(key, client_nonce).
+        device_finish_hmac = _ecb_decrypt(enc_finish)[:32]
+        h2 = crypto_hmac.HMAC(real_key, SHA256(), backend=openssl_backend)
+        h2.update(local_nonce)
+        if h2.finalize() != device_finish_hmac:
+            raise InvalidMessage("Device HMAC verification failed in SESS_KEY_NEG_FINISH")
+
+        # Step 4: Derive session key = AES-ECB(XOR(client_nonce, device_nonce)).
+        xored = bytes(a ^ b for a, b in zip(local_nonce, device_nonce))
+        session_key = _ecb_encrypt(xored)
+
+        if session_key[0] == 0x00:
+            # Reconnect will give us a fresh device 0x03 with new nonces.
+            raise ConnectionFailedException(
+                "v3.4 session key starts with 0x00 — will retry on reconnect"
+            )
+
+        self.cipher.set_session_key(session_key)
+        self._LOGGER.debug("v3.4 session key negotiated successfully for %s", self)
+        await asyncio.sleep(0.1)
 
     async def async_disable(self) -> None:
         """Disable the device.
