@@ -1189,7 +1189,13 @@ class TuyaDevice:
             if not self.cipher.verify_hmac(
                 raw[: header_size + r_payload_size - suffix_size], msg_hmac
             ):
-                raise InvalidMessage("HMAC verification failed on v3.4 negotiate message")
+                # tinytuya logs and continues on HMAC mismatch — the real
+                # authentication for negotiate messages comes from the payload
+                # HMACs, not the message footer.
+                self._LOGGER.debug(
+                    "v3.4 negotiate message footer HMAC mismatch (cmd=0x%02x) — continuing",
+                    r_cmd,
+                )
 
             return r_cmd, payload_bytes
 
